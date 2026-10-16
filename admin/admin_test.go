@@ -167,6 +167,40 @@ func TestAdminRouting(t *testing.T) {
 	}
 }
 
+// TestAdminCreateCustomToken 验证管理 API 手动录入 token：
+// 指定 token 字段时按录入值签发，重复/非法格式返回 400。
+func TestAdminCreateCustomToken(t *testing.T) {
+	ts, tokens := newTestAdmin(t, "pw")
+	cookie := loginAdmin(t, ts.URL, "pw")
+
+	// 手动录入
+	status, out := doAdmin(t, http.MethodPost, ts.URL+"/api/tokens",
+		map[string]any{"token": "my-custom-token", "name": "manual", "ttl_hours": 1}, cookie)
+	if status != http.StatusOK {
+		t.Fatalf("create custom status = %d, want 200 (out=%v)", status, out)
+	}
+	if out["token"] != "my-custom-token" {
+		t.Errorf("created token = %v, want my-custom-token", out["token"])
+	}
+	if !tokens.Verify("my-custom-token") {
+		t.Error("custom token not verifiable after creation")
+	}
+
+	// 重复录入 → 400
+	status, _ = doAdmin(t, http.MethodPost, ts.URL+"/api/tokens",
+		map[string]any{"token": "my-custom-token"}, cookie)
+	if status != http.StatusBadRequest {
+		t.Fatalf("duplicate status = %d, want 400", status)
+	}
+
+	// 非法格式（含空格）→ 400
+	status, _ = doAdmin(t, http.MethodPost, ts.URL+"/api/tokens",
+		map[string]any{"token": "has space"}, cookie)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid token status = %d, want 400", status)
+	}
+}
+
 // TestGeneratePassword 验证随机管理员密码的格式与唯一性。
 func TestGeneratePassword(t *testing.T) {
 	seen := map[string]bool{}

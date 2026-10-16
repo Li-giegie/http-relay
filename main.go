@@ -1,11 +1,14 @@
 // http-relay 是一个 HTTP 中继服务端：
 // 将收到的请求原样透传到 X-Upstream-Target（或查询参数 upstream_target）
 // 指定的上游地址，并把上游响应流式写回客户端。
+// X-Upstream-Target 支持多个目标（逗号/空白分隔），每个中继节点消费一个，
+// 剩余的随该头传给下一跳，形成链式中继。
 // main 只做装配：转发面（relay）与认证实现（auth）通过 relay.Authorizer
 // 接口解耦，管理面（admin）与认证实现通过 admin.TokenManager 接口解耦。
 // token 认证由 --enable-auth 显式开关：不开时中继不校验 token；
 // 管理界面由 --admin-addr 非空即启用。
-// token 为 JWT（过期时间 + 使用次数上限），签发记录仅存内存，重启即失效。
+// token 为不透明随机串或管理员手动录入的值（过期时间 + 使用次数上限），
+// 签发记录仅存内存，重启即失效。
 package main
 
 import (
@@ -62,7 +65,7 @@ func main() {
 	var authorizer relay.Authorizer
 	if *enableAuth {
 		authorizer = tokens
-		log.Printf("token auth enabled (JWT, in-memory, use %s header)", relay.RelayTokenHeader)
+		log.Printf("token auth enabled (opaque token, in-memory, use %s header)", relay.RelayTokenHeader)
 	} else {
 		log.Printf("token auth disabled: relay does not verify tokens")
 	}

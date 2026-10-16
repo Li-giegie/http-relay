@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,10 +22,10 @@ import (
 )
 
 // TokenManager 是管理面对 token 存储的抽象：
-// 签发（带有效期与次数上限）、删除（撤销）、列出全部记录。
+// 签发（自动生成或手动录入，带有效期与次数上限）、删除（撤销）、列出全部记录。
 // auth.TokenStore 实现了该接口。
 type TokenManager interface {
-	Create(name string, ttl time.Duration, maxUses int64) (plaintext string, info auth.TokenInfo, err error)
+	Create(customToken, name string, ttl time.Duration, maxUses int64) (plaintext string, info auth.TokenInfo, err error)
 	Delete(id string) bool
 	List() []auth.TokenInfo
 }
@@ -151,12 +152,12 @@ func (a *AdminServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleList 返回全部签发记录（含完整 JWT 明文，界面可见）。
+// handleList 返回全部签发记录（含完整 token 明文，界面可见）。
 func (a *AdminServer) handleList(w http.ResponseWriter, r *http.Request) {
 	type item struct {
-		ID        string `json:"id"` // jti
+		ID        string `json:"id"` // 记录唯一 id
 		Name      string `json:"name"`
-		Token     string `json:"token"` // 完整 JWT，可见可复制
+		Token     string `json:"token"` // 完整 token 明文，可见可复制
 		CreatedAt string `json:"created_at"`
 		ExpiresAt string `json:"expires_at"` // 空串 = 永不过期
 		MaxUses   int64  `json:"max_uses"`   // 0 = 不限
@@ -189,9 +190,11 @@ func (a *AdminServer) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreate 签发 token；明文随列表可见，响应中直接返回。
+// body.token 非空时为手动录入（需合法且不重复），为空时自动生成；
 // body.ttl_hours <= 0 表示永不过期；body.max_uses <= 0 表示不限次数。
 func (a *AdminServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		Token    string `json:"token"`
 		Name     string `json:"name"`
 		TTLHours int64  `json:"ttl_hours"`
 		MaxUses  int64  `json:"max_uses"`
@@ -200,10 +203,15 @@ func (a *AdminServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	plaintext, info, err := a.tokens.Create(strings.TrimSpace(body.Name),
-		time.Duration(body.TTLHours)*time.Hour, body.MaxUses)
+	plaintext, info, err := a.tokens.Create(strings.TrimSpace(body.Token),
+		strings.TrimSpace(body.Name), time.Duration(body.TTLHours)*time.Hour, body.MaxUses)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		// 手动录入的 token 非法或重复属调用方错误，返回 400；其余为 500。
+		if errors.Is(err, auth.ErrInvalidToken) || errors.Is(err, auth.ErrTokenExists) {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 	expires := ""
@@ -219,7 +227,7 @@ func (a *AdminServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDelete 按路径中的 id（jti）删除签发记录（= 撤销）。
+// handleDelete 按路径中的 id（记录唯一 id）删除签发记录（= 撤销）。
 func (a *AdminServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {

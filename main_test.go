@@ -135,7 +135,7 @@ func TestEndToEnd(t *testing.T) {
 // TestEndToEndExpired 签发即过期的 token 直接被 relay 拒绝。
 func TestEndToEndExpired(t *testing.T) {
 	tokens := auth.NewTokenStore()
-	plaintext, _, err := tokens.Create("expired", -time.Hour, 0)
+	plaintext, _, err := tokens.Create("", "expired", -time.Hour, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

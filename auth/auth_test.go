@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -10,7 +11,7 @@ import (
 // TestCreateAndVerify 验证签发的 token 能通过校验，且格式符合预期。
 func TestCreateAndVerify(t *testing.T) {
 	s := NewTokenStore()
-	token, info, err := s.Create("test-token", time.Hour, 0)
+	token, info, err := s.Create("", "test-token", time.Hour, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -32,7 +33,7 @@ func TestCreateAndVerify(t *testing.T) {
 // TestVerifyRejectsWrong 验证未知/篡改 token 被拒绝。
 func TestVerifyRejectsWrong(t *testing.T) {
 	s := NewTokenStore()
-	token, _, err := s.Create("t", time.Hour, 0)
+	token, _, err := s.Create("", "t", time.Hour, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestVerifyRejectsWrong(t *testing.T) {
 // TestVerifyExpired 验证过期 token 被拒绝。
 func TestVerifyExpired(t *testing.T) {
 	s := NewTokenStore()
-	token, _, err := s.Create("expired", -time.Hour, 0) // 已过期
+	token, _, err := s.Create("", "expired", -time.Hour, 0) // 已过期
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -73,7 +74,7 @@ func TestVerifyExpired(t *testing.T) {
 // TestMaxUses 验证使用次数上限：第 maxUses 次成功，之后拒绝。
 func TestMaxUses(t *testing.T) {
 	s := NewTokenStore()
-	token, _, err := s.Create("limited", time.Hour, 3)
+	token, _, err := s.Create("", "limited", time.Hour, 3)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -93,7 +94,7 @@ func TestMaxUses(t *testing.T) {
 // TestVerifyUpdatesUsage 验证命中后 Uses 与 LastUsed 被更新。
 func TestVerifyUpdatesUsage(t *testing.T) {
 	s := NewTokenStore()
-	token, _, err := s.Create("t", time.Hour, 0)
+	token, _, err := s.Create("", "t", time.Hour, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestVerifyUpdatesUsage(t *testing.T) {
 // TestDelete 验证删除（撤销）后 token 立即失效。
 func TestDelete(t *testing.T) {
 	s := NewTokenStore()
-	token, info, err := s.Create("doomed", time.Hour, 0)
+	token, info, err := s.Create("", "doomed", time.Hour, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -132,7 +133,7 @@ func TestDelete(t *testing.T) {
 // TestUnlimitedToken 验证 ttl=0 且 maxUses=0 时永不过期、不限次数。
 func TestUnlimitedToken(t *testing.T) {
 	s := NewTokenStore()
-	token, info, err := s.Create("forever", 0, 0)
+	token, info, err := s.Create("", "forever", 0, 0)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -146,12 +147,60 @@ func TestUnlimitedToken(t *testing.T) {
 	}
 }
 
+// TestCreateCustomToken 验证手动录入的 token：原样保存可校验，
+// 重复录入与非可见 ASCII 字符被拒绝。
+func TestCreateCustomToken(t *testing.T) {
+	s := NewTokenStore()
+	const custom = "my-own-token-123"
+	plaintext, info, err := s.Create(custom, "manual", time.Hour, 0)
+	if err != nil {
+		t.Fatalf("create custom: %v", err)
+	}
+	if plaintext != custom || info.Token != custom {
+		t.Fatalf("plaintext/info.Token = %q/%q, want %q (custom token kept as-is)", plaintext, info.Token, custom)
+	}
+	if !s.Verify(custom) {
+		t.Fatal("Verify(custom token) = false, want true")
+	}
+
+	// 重复录入 → ErrTokenExists
+	if _, _, err := s.Create(custom, "dup", time.Hour, 0); !errors.Is(err, ErrTokenExists) {
+		t.Fatalf("duplicate create err = %v, want ErrTokenExists", err)
+	}
+	// 与已自动生成的 token 重复 → 同样拒绝
+	auto, _, err := s.Create("", "auto", time.Hour, 0)
+	if err != nil {
+		t.Fatalf("create auto: %v", err)
+	}
+	if _, _, err := s.Create(auto, "dup-auto", time.Hour, 0); !errors.Is(err, ErrTokenExists) {
+		t.Fatalf("duplicate auto err = %v, want ErrTokenExists", err)
+	}
+
+	// 非法格式 → ErrInvalidToken
+	for i, bad := range []string{
+		"has space",
+		"has\ttab",
+		"中文token",
+		"ctrl\x01char",
+		"trailing\n",
+		strings.Repeat("x", 129), // 超长
+	} {
+		if _, _, err := s.Create(bad, "bad", time.Hour, 0); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("case %d %q: err = %v, want ErrInvalidToken", i, bad, err)
+		}
+	}
+	// 长度上限边界：正好 128 字符合法
+	if _, _, err := s.Create(strings.Repeat("x", 128), "edge", time.Hour, 0); err != nil {
+		t.Errorf("128-char token rejected: %v", err)
+	}
+}
+
 // TestTokenUniqueness 验证连续签发不产生重复 token。
 func TestTokenUniqueness(t *testing.T) {
 	s := NewTokenStore()
 	seen := map[string]bool{}
 	for i := 0; i < 100; i++ {
-		token, _, err := s.Create("u", time.Hour, 0)
+		token, _, err := s.Create("", "u", time.Hour, 0)
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -170,7 +219,7 @@ func TestConcurrentVerify(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			token, info, err := s.Create("c", time.Hour, 0)
+			token, info, err := s.Create("", "c", time.Hour, 0)
 			if err != nil {
 				t.Errorf("create: %v", err)
 				return

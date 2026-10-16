@@ -99,7 +99,10 @@
     <input type="number" id="tokenMaxUses" class="narrow" placeholder="次数上限" min="0" title="0 或留空 = 不限次数">
     <button id="createBtn">签发 Token</button>
   </div>
-  <p class="hint">有效期 / 次数上限填 0 或留空表示不限制。Token 保存在内存中，服务重启后全部失效需重新签发。</p>
+  <div class="toolbar">
+    <input type="text" id="tokenCustom" placeholder="自定义 Token（留空自动生成）" maxlength="128" autocomplete="off" spellcheck="false">
+  </div>
+  <p class="hint">有效期 / 次数上限填 0 或留空表示不限制。自定义 Token 仅允许可见 ASCII 字符（不含空格）、最长 128 字符、不可与已签发的重复。Token 保存在内存中，服务重启后全部失效需重新签发。</p>
   <table>
     <thead>
       <tr>
@@ -258,6 +261,7 @@ $('createBtn').addEventListener('click', async () => {
     await api('/api/tokens', {
       method: 'POST',
       body: JSON.stringify({
+        token: $('tokenCustom').value.trim(),
         name: $('tokenName').value.trim(),
         ttl_hours: isNaN(ttl) ? 0 : ttl,
         max_uses: isNaN(maxUses) ? 0 : maxUses,
@@ -266,6 +270,7 @@ $('createBtn').addEventListener('click', async () => {
     $('tokenName').value = '';
     $('tokenTTL').value = '';
     $('tokenMaxUses').value = '';
+    $('tokenCustom').value = '';
     refresh();
   } catch (err) {
     showAdminMsg(err.message, true);

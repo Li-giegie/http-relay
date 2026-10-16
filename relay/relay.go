@@ -24,7 +24,11 @@ type Authorizer interface {
 
 // UpstreamTargetHeader 指定本次请求的转发目标（必传），
 // 例如 X-Upstream-Target: https://api.anthropic.com。
-// 该头是中继自身的控制头，不会转发给上游。
+// 支持多个目标（逗号或空白分隔，也可重复设置该头）：每个中继节点
+// 消费第一个目标作为本跳上游，剩余目标继续随该头转发给下一跳，
+// 形成链式中继（A, B, C → 本节点转发到 A 并携带 "B, C"，
+// A 处的中继节点再消费 B，以此类推，最后一个目标为最终上游）。
+// 该头是中继自身的控制头；无剩余目标时不转发给上游。
 const UpstreamTargetHeader = "X-Upstream-Target"
 
 // UpstreamTargetParam 与 UpstreamTargetHeader 同作用，通过查询参数指定
@@ -55,7 +59,8 @@ func New(client *http.Client, authorizer Authorizer) *Relay {
 }
 
 // ServeHTTP 处理一次中继转发：先做 token 认证（若启用），
-// 再读取并校验 X-Upstream-Target，把请求原样发往 base+请求路径，
+// 再读取并校验 X-Upstream-Target（支持多个目标，消费第一个），
+// 把请求原样发往 base+请求路径，剩余目标随控制头传给下一跳，
 // 最后把上游响应流式写回客户端。
 func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
@@ -75,22 +80,26 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 上游目标必传（请求头或查询参数二选一），
-	// 且必须是合法的 http/https URL、带主机名。
-	target := req.Header.Get(UpstreamTargetHeader)
-	if target == "" {
-		target = query.Get(UpstreamTargetParam)
-	}
-	if target == "" {
+	// 上游目标必传（请求头或查询参数二选一），支持多个：
+	// 每到一个中继节点消费一个（第一个），剩余的随 X-Upstream-Target
+	// 转发给下一跳。所有目标逐个校验，任一非法即 400。
+	targets := collectTargets(req.Header.Values(UpstreamTargetHeader), query[UpstreamTargetParam])
+	if len(targets) == 0 {
 		http.Error(w, "missing required header "+UpstreamTargetHeader+
 			" or query param "+UpstreamTargetParam, http.StatusBadRequest)
 		return
 	}
-	u, err := url.Parse(target)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		http.Error(w, fmt.Sprintf("invalid upstream target %q: must be a valid http/https URL with host", target), http.StatusBadRequest)
-		return
+	targetURLs := make([]*url.URL, len(targets))
+	for i, target := range targets {
+		u, err := url.Parse(target)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			http.Error(w, fmt.Sprintf("invalid upstream target #%d %q: must be a valid http/https URL with host", i+1, target), http.StatusBadRequest)
+			return
+		}
+		targetURLs[i] = u
 	}
+	u := targetURLs[0]       // 本节点消费的目标
+	remaining := targets[1:] // 剩余目标，转发给下一跳
 
 	// 目标 URL = 上游 base（可含基路径，去尾斜杠）+ 请求路径 + 查询串。
 	outURL := *u
@@ -125,7 +134,12 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	outReq.ContentLength = req.ContentLength
 	// 删除中继自身的控制头与逐跳头；Content-Length / Transfer-Encoding
 	// 交给 net/http 按实际 Body 重新计算，避免冲突。
+	// 链式转发：有剩余目标时把剩余目标写回 X-Upstream-Target 传给下一跳
+	// （下一跳若也是 http-relay 节点会继续消费），无剩余时不转发该头。
 	outReq.Header.Del(UpstreamTargetHeader)
+	if len(remaining) > 0 {
+		outReq.Header.Set(UpstreamTargetHeader, strings.Join(remaining, ", "))
+	}
 	outReq.Header.Del(RelayTokenHeader)
 	outReq.Header.Del("Content-Length")
 	removeHopByHop(outReq.Header)
@@ -172,8 +186,32 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	log.Printf("%s %s upstream=%s status=%d dur=%s",
-		req.Method, req.URL.RequestURI(), u, resp.StatusCode, time.Since(start).Round(time.Millisecond))
+	// 链式转发时在访问日志中带上剩余目标，便于排查多跳链路。
+	next := ""
+	if len(remaining) > 0 {
+		next = " next=[" + strings.Join(remaining, " ") + "]"
+	}
+	log.Printf("%s %s upstream=%s%s status=%d dur=%s",
+		req.Method, req.URL.RequestURI(), u, next, resp.StatusCode, time.Since(start).Round(time.Millisecond))
+}
+
+// collectTargets 汇总并拆分上游目标列表：请求头值优先，头为空时用查询参数值；
+// 每个值内部以逗号或空白分隔（URL 本身不含原始空格，逗号分隔是列表约定，
+// 目标 URL 内含逗号时需改用单目标），空项忽略。
+func collectTargets(headerValues, paramValues []string) []string {
+	src := headerValues
+	if len(src) == 0 {
+		src = paramValues
+	}
+	var targets []string
+	for _, v := range src {
+		for _, part := range strings.FieldsFunc(v, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t'
+		}) {
+			targets = append(targets, part)
+		}
+	}
+	return targets
 }
 
 // removeHopByHop 删除逐跳 Header，包括 Connection 头中声明的扩展头。

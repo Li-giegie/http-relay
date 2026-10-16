@@ -204,6 +204,103 @@ func TestInvalidUpstreamTarget(t *testing.T) {
 	}
 }
 
+// TestMultiTargetChain 验证多目标链式消费：X-Upstream-Target 携带
+// 逗号分隔的多个目标时，本节点消费第一个并把剩余目标转发给下一跳；
+// 下一跳（另一个 relay 实例）继续消费，最后一跳不再转发该头。
+func TestMultiTargetChain(t *testing.T) {
+	var finalHit bool
+	finalUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		finalHit = true
+		if got := r.Header.Get(UpstreamTargetHeader); got != "" {
+			t.Errorf("final upstream received %s = %q, must be stripped on last hop", UpstreamTargetHeader, got)
+		}
+		io.WriteString(w, "final-ok")
+	}))
+	defer finalUpstream.Close()
+
+	// 第二跳 relay：收到 "finalUpstream" 单目标，消费后不再转发该头。
+	relay2 := newTestRelay(t)
+
+	// 第一跳 relay：消费 relay2，剩余 finalUpstream 转发给下一跳。
+	relay1 := newTestRelay(t)
+
+	req, _ := http.NewRequest(http.MethodGet, relay1.URL+"/v1/x?k=1", nil)
+	req.Header.Set(UpstreamTargetHeader, relay2.URL+", "+finalUpstream.URL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("relay chain request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !finalHit {
+		t.Fatal("request did not reach the final upstream through both relay hops")
+	}
+	if string(body) != "final-ok" {
+		t.Fatalf("body = %q, want %q", body, "final-ok")
+	}
+}
+
+// TestMultiTargetSplits 验证多目标的分隔方式：
+// 逗号、空白混合分隔与重复设置请求头均可，查询参数形式同样支持
+// （剩余目标改用请求头转发给下一跳，控制参数仍被剥除）。
+// 下一跳用普通 httptest 服务充当，只验证第一跳转发出去的头与查询串。
+func TestMultiTargetSplits(t *testing.T) {
+	var gotHeader string
+	var gotQuery url.Values
+	nextHop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get(UpstreamTargetHeader)
+		gotQuery = r.URL.Query()
+	}))
+	defer nextHop.Close()
+
+	finalTarget := "http://final.example.com"
+	relay1 := newTestRelay(t)
+
+	// 两个请求头值 + 逗号收尾
+	req, _ := http.NewRequest(http.MethodGet, relay1.URL+"/v1/x", nil)
+	req.Header.Add(UpstreamTargetHeader, nextHop.URL+",")
+	req.Header.Add(UpstreamTargetHeader, finalTarget)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("relay request: %v", err)
+	}
+	resp.Body.Close()
+	if gotHeader != finalTarget {
+		t.Fatalf("next hop received %s = %q, want %q", UpstreamTargetHeader, gotHeader, finalTarget)
+	}
+
+	// 查询参数指定多目标：剩余目标改用请求头到达下一跳，参数本身被剥除
+	gotHeader = ""
+	req, _ = http.NewRequest(http.MethodGet, relay1.URL+"/v1/x?k=1&"+UpstreamTargetParam+"="+
+		url.QueryEscape(nextHop.URL)+","+url.QueryEscape(finalTarget), nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("relay request (query param): %v", err)
+	}
+	resp.Body.Close()
+	if gotHeader != finalTarget {
+		t.Fatalf("next hop received %s = %q, want %q (remaining targets forwarded via header)", UpstreamTargetHeader, gotHeader, finalTarget)
+	}
+	if gotQuery.Get(UpstreamTargetParam) != "" || gotQuery.Get("k") != "1" {
+		t.Errorf("next hop query = %v, want k=1 only (control param stripped)", gotQuery)
+	}
+}
+
+// TestMultiTargetInvalidAny 验证目标列表中任一目标非法即返回 400。
+func TestMultiTargetInvalidAny(t *testing.T) {
+	relay := newTestRelay(t)
+	req, _ := http.NewRequest(http.MethodGet, relay.URL+"/", nil)
+	req.Header.Set(UpstreamTargetHeader, "http://127.0.0.1:1, ftp://example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("relay request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (one of the targets is invalid)", resp.StatusCode)
+	}
+}
+
 // TestUpstreamUnreachable 上游连接失败时应返回 502。
 func TestUpstreamUnreachable(t *testing.T) {
 	proxy := newTestRelay(t)
