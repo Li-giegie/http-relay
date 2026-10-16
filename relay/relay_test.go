@@ -1,4 +1,4 @@
-package main
+package relay
 
 import (
 	"bufio"
@@ -15,7 +15,7 @@ import (
 // newTestRelay 启动一个挂在 httptest 上的中继实例。
 func newTestRelay(t *testing.T) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(New(nil))
+	ts := httptest.NewServer(New(nil, nil))
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -310,7 +310,7 @@ func TestOutboundHTTPS(t *testing.T) {
 	}
 
 	// httptest 的自签证书不被系统信任，测试中跳过校验。
-	relay := New(&http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}})
+	relay := New(&http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}, nil)
 	proxy := httptest.NewServer(relay)
 	defer proxy.Close()
 
@@ -338,7 +338,7 @@ func TestInboundTLS(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	relayTLS := httptest.NewTLSServer(New(nil))
+	relayTLS := httptest.NewTLSServer(New(nil, nil))
 	defer relayTLS.Close()
 
 	client := &http.Client{
@@ -381,18 +381,109 @@ func TestStatusPreserved(t *testing.T) {
 	}
 }
 
-// TestValidateListenAddr 监听地址校验：拒绝 0.0.0.0 / :: / 空 host。
+// TestValidateListenAddr 监听地址校验：格式非法/缺端口报错；
+// 0.0.0.0 / [::] / 空 host（绑定所有网卡）允许。
 func TestValidateListenAddr(t *testing.T) {
-	bad := []string{"0.0.0.0:8080", ":8080", ":::8080", "not-an-addr"}
+	bad := []string{"not-an-addr", "127.0.0.1", ":", ":::8080"} // 非法格式 / 缺端口 / IPv6 需写作 [::]
 	for _, addr := range bad {
 		if err := ValidateListenAddr(addr); err == nil {
 			t.Errorf("ValidateListenAddr(%q) = nil, want error", addr)
 		}
 	}
-	good := []string{"127.0.0.1:8080", "10.8.0.2:8080", "192.168.1.5:9000"}
+	good := []string{"127.0.0.1:8080", "0.0.0.0:8080", ":8080", "[::]:8080", "10.8.0.2:8080", "192.168.1.5:9000"}
 	for _, addr := range good {
 		if err := ValidateListenAddr(addr); err != nil {
 			t.Errorf("ValidateListenAddr(%q) = %v, want nil", addr, err)
 		}
+	}
+}
+
+// fakeAuth 是 Authorizer 的测试替身：只认 tokens 里的值。
+type fakeAuth map[string]bool
+
+func (f fakeAuth) Verify(token string) bool { return f[token] }
+
+// TestRelayAuth 验证 token 认证：缺失/错误 401，正确放行；
+// relay_token 查询参数同样生效且被剥除；认证头不透传给上游。
+// 用 fakeAuth 而非真实实现，保证转发面测试与授权实现解耦。
+func TestRelayAuth(t *testing.T) {
+	var gotQuery url.Values
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		if r.Header.Get(RelayTokenHeader) != "" {
+			t.Errorf("upstream received %s header", RelayTokenHeader)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	token := "good-token"
+	proxy := httptest.NewServer(New(nil, fakeAuth{token: true}))
+	t.Cleanup(proxy.Close)
+
+	// 辅助：发一次带任意头的请求。
+	do := func(extra func(*http.Request)) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, proxy.URL+"/v1/x?k=1", nil)
+		req.Header.Set(UpstreamTargetHeader, upstream.URL)
+		if extra != nil {
+			extra(req)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("relay request: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	// 缺失 token → 401
+	if resp := do(nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: status = %d, want 401", resp.StatusCode)
+	}
+	// 错误 token → 401
+	if resp := do(func(r *http.Request) { r.Header.Set(RelayTokenHeader, "bad-token") }); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad token: status = %d, want 401", resp.StatusCode)
+	}
+	// 正确 token（请求头）→ 200，且上游查询串不含 relay_token
+	if resp := do(func(r *http.Request) { r.Header.Set(RelayTokenHeader, token) }); resp.StatusCode != http.StatusOK {
+		t.Fatalf("good token: status = %d, want 200", resp.StatusCode)
+	}
+	if gotQuery.Get(RelayTokenParam) != "" || gotQuery.Get("k") != "1" {
+		t.Errorf("upstream query = %v, want k=1 only", gotQuery)
+	}
+	// 查询参数 relay_token → 200，参数被剥除
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+"/v1/x?k=1&"+RelayTokenParam+"="+token, nil)
+	req.Header.Set(UpstreamTargetHeader, upstream.URL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("relay request (query param): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("query-param token: status = %d, want 200", resp.StatusCode)
+	}
+	if gotQuery.Get(RelayTokenParam) != "" || gotQuery.Get("k") != "1" {
+		t.Errorf("upstream query = %v, want k=1 only", gotQuery)
+	}
+}
+
+// TestRelayNoAuthWhenAuthorizerNil 验证 Authorizer 为 nil 时无认证。
+func TestRelayNoAuthWhenAuthorizerNil(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxy := newTestRelay(t) // New(nil, nil)，不认证
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+"/v1/x", nil)
+	req.Header.Set(UpstreamTargetHeader, upstream.URL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("relay request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (auth should be off)", resp.StatusCode)
 	}
 }

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http-relay 管理台</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1f2430; --muted: #6b7280;
+    --border: #e3e6ea; --accent: #2563eb; --accent-hover: #1d4ed8;
+    --danger: #dc2626; --danger-hover: #b91c1c; --ok: #16a34a;
+    --warn: #d97706;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: flex; justify-content: center; padding: 40px 24px;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 32px 36px; width: 100%; max-width: 960px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06); align-self: flex-start;
+  }
+  .card.login-card { max-width: 420px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  input[type=password], input[type=text], input[type=number] {
+    width: 100%; padding: 10px 12px; font-size: 14px;
+    border: 1px solid var(--border); border-radius: 6px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  button {
+    padding: 8px 16px; font-size: 13px; border: none; border-radius: 6px;
+    cursor: pointer; background: var(--accent); color: #fff;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  button.danger { background: var(--danger); }
+  button.danger:hover { background: var(--danger-hover); }
+  button.ghost { background: none; color: var(--muted); border: 1px solid var(--border); }
+  button.ghost:hover { background: var(--bg); color: var(--text); }
+  .msg { font-size: 13px; margin-top: 12px; min-height: 18px; }
+  .msg.error { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 8px; }
+  .toolbar input { flex: 1; }
+  .toolbar .narrow { flex: 0 0 120px; }
+  .hint { font-size: 12px; color: var(--muted); margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  th.col-name { width: 12%; }
+  th.col-token { width: 30%; }
+  th.col-time { width: 13%; }
+  th.col-uses { width: 9%; }
+  th.col-actions { width: 16%; }
+  td.mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; word-break: break-all; user-select: all; }
+  td.expired { color: var(--danger); }
+  .empty { color: var(--muted); text-align: center; padding: 24px 0; font-size: 13px; }
+  .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  .header-row button { background: none; color: var(--muted); padding: 4px 8px; }
+  .header-row button:hover { color: var(--text); background: none; }
+  .actions { display: flex; gap: 6px; }
+  .hidden { display: none; }
+  .form-row { margin-bottom: 16px; }
+</style>
+</head>
+<body>
+
+<!-- 登录视图 -->
+<div class="card login-card hidden" id="loginView">
+  <h1>http-relay 管理台</h1>
+  <p class="sub">请输入管理员账号密码</p>
+  <form id="loginForm">
+    <div class="form-row">
+      <label for="username">账号</label>
+      <input type="text" id="username" value="admin" autocomplete="username">
+    </div>
+    <div class="form-row">
+      <label for="password">密码</label>
+      <input type="password" id="password" autocomplete="current-password">
+    </div>
+    <button type="submit" id="loginBtn">登录</button>
+    <div class="msg error" id="loginMsg"></div>
+  </form>
+</div>
+
+<!-- 管理视图 -->
+<div class="card hidden" id="adminView">
+  <div class="header-row">
+    <h1>访问 Token 管理</h1>
+    <button id="logoutBtn">退出登录</button>
+  </div>
+  <div class="toolbar">
+    <input type="text" id="tokenName" placeholder="备注名，如 my-laptop" maxlength="64">
+    <input type="number" id="tokenTTL" class="narrow" placeholder="有效期(小时)" min="0" title="0 或留空 = 永不过期">
+    <input type="number" id="tokenMaxUses" class="narrow" placeholder="次数上限" min="0" title="0 或留空 = 不限次数">
+    <button id="createBtn">签发 Token</button>
+  </div>
+  <p class="hint">有效期 / 次数上限填 0 或留空表示不限制。Token 保存在内存中，服务重启后全部失效需重新签发。</p>
+  <table>
+    <thead>
+      <tr>
+        <th class="col-name">备注名</th>
+        <th class="col-token">Token</th>
+        <th class="col-time">过期时间</th>
+        <th class="col-uses">次数</th>
+        <th class="col-time">最后使用</th>
+        <th class="col-actions">操作</th>
+      </tr>
+    </thead>
+    <tbody id="tokenBody"></tbody>
+  </table>
+  <div class="empty" id="emptyTip">还没有 token，签发一个吧</div>
+  <div class="msg" id="adminMsg"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const loginView = $('loginView'), adminView = $('adminView');
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, {
+    headers: {'Content-Type': 'application/json'},
+    ...opts,
+  });
+  if (resp.status === 401 && path !== '/api/login') {
+    showLogin(); // session 失效，切回登录视图
+    throw new Error('未登录');
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  return data;
+}
+
+function showLogin() {
+  adminView.classList.add('hidden');
+  loginView.classList.remove('hidden');
+  $('loginMsg').textContent = '';
+  $('password').value = '';
+}
+
+function showAdmin() {
+  loginView.classList.add('hidden');
+  adminView.classList.remove('hidden');
+  refresh();
+}
+
+// ---- 登录 / 退出 ----
+$('loginForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('loginBtn').disabled = true;
+  $('loginMsg').textContent = '';
+  try {
+    await api('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: $('username').value.trim(),
+        password: $('password').value,
+      }),
+    });
+    showAdmin();
+  } catch (err) {
+    $('loginMsg').textContent = err.message === 'wrong username or password'
+      ? '账号或密码错误' : err.message;
+  } finally {
+    $('loginBtn').disabled = false;
+  }
+});
+
+$('logoutBtn').addEventListener('click', async () => {
+  try { await api('/api/logout', {method: 'POST'}); } catch {}
+  showLogin();
+});
+
+// ---- token 列表 ----
+async function refresh() {
+  try {
+    const {tokens} = await api('/api/tokens');
+    const body = $('tokenBody');
+    body.innerHTML = '';
+    $('emptyTip').classList.toggle('hidden', tokens.length > 0);
+    for (const t of tokens) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td></td>
+        <td class="mono"></td>
+        <td></td>
+        <td></td>
+        <td></td>
+        <td></td>`;
+      const cells = tr.querySelectorAll('td');
+      cells[0].textContent = t.name || '（未命名）';
+      cells[1].textContent = t.token;
+      cells[2].textContent = t.expires_at ? fmtTime(t.expires_at) : '永不过期';
+      if (t.expires_at && new Date(t.expires_at) < new Date()) {
+        cells[2].classList.add('expired');
+        cells[2].textContent += '（已过期）';
+      }
+      cells[3].textContent = t.max_uses > 0
+        ? `${t.uses} / ${t.max_uses}`
+        : `${t.uses} / ∞`;
+      cells[4].textContent = t.last_used ? fmtTime(t.last_used) : '从未使用';
+
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      const copy = document.createElement('button');
+      copy.className = 'ghost';
+      copy.textContent = '复制';
+      copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(t.token);
+          copy.textContent = '已复制 ✓';
+          setTimeout(() => { copy.textContent = '复制'; }, 1500);
+        } catch { showAdminMsg('复制失败，请手动选择复制', true); }
+      };
+      const del = document.createElement('button');
+      del.className = 'danger';
+      del.textContent = '删除';
+      del.onclick = async () => {
+        if (!confirm(`确定删除 token「${t.name || t.token.slice(0, 16) + '…'}」？删除后立即失效。`)) return;
+        try {
+          await api('/api/tokens/' + encodeURIComponent(t.id), {method: 'DELETE'});
+          refresh();
+        } catch (err) { showAdminMsg(err.message, true); }
+      };
+      actions.appendChild(copy);
+      actions.appendChild(del);
+      cells[5].appendChild(actions);
+      body.appendChild(tr);
+    }
+  } catch (err) {
+    if (err.message !== '未登录') showAdminMsg(err.message, true);
+  }
+}
+
+function fmtTime(iso) {
+  const d = new Date(iso);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function showAdminMsg(text, isErr) {
+  const el = $('adminMsg');
+  el.textContent = text;
+  el.className = 'msg ' + (isErr ? 'error' : 'ok');
+  setTimeout(() => { el.textContent = ''; }, 3000);
+}
+
+// ---- 签发 token ----
+$('createBtn').addEventListener('click', async () => {
+  $('createBtn').disabled = true;
+  try {
+    const ttl = parseInt($('tokenTTL').value, 10);
+    const maxUses = parseInt($('tokenMaxUses').value, 10);
+    await api('/api/tokens', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: $('tokenName').value.trim(),
+        ttl_hours: isNaN(ttl) ? 0 : ttl,
+        max_uses: isNaN(maxUses) ? 0 : maxUses,
+      }),
+    });
+    $('tokenName').value = '';
+    $('tokenTTL').value = '';
+    $('tokenMaxUses').value = '';
+    refresh();
+  } catch (err) {
+    showAdminMsg(err.message, true);
+  } finally {
+    $('createBtn').disabled = false;
+  }
+});
+
+// ---- 启动：检测登录状态 ----
+(async () => {
+  try {
+    await api('/api/tokens');
+    showAdmin();
+  } catch {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
